@@ -1,0 +1,10 @@
+{
+  "f_min": 20,
+  "f_max": 20000,
+  "f_min_generated": 17.39130434782609,
+  "f_max_generated": 23000.0,
+  "margin_ratio": 0.15,
+  "duration": 30,
+  "samplerate": 48000,
+  "mono_channel": null
+}
