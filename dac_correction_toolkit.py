@@ -133,10 +133,12 @@ WORKFLOW COMPLET
 """
 
 import argparse
+import concurrent.futures
 import csv
 import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 from fractions import Fraction
@@ -1299,26 +1301,162 @@ def cmd_apply(args):
 
 
 def cmd_batch_apply(args):
-    """Applique le profil de correction à tous les fichiers audio d'un
-    dossier (extensions supportées: flac, wav, mp3, m4a, ogg), en conservant
-    le nom de fichier d'origine dans le dossier de sortie."""
+    """Applique le profil de correction à tous les fichiers audio d'une
+    ARBORESCENCE complète (parcours récursif), en préservant intégralement
+    la structure de dossiers d'origine dans la sortie.
+
+    Pensé pour une vraie bibliothèque musicale : artistes/albums en
+    sous-dossiers imbriqués, noms de fichiers en n'importe quel alphabet
+    (japonais, etc. — Python/os.walk gèrent nativement l'UTF-8, aucun
+    traitement spécial n'est nécessaire), et fichiers annexes mélangés aux
+    pistes audio (pochettes .jpg/.png, paroles .lrc...).
+
+    CE QUE CETTE VERSION GÈRE, EN PLUS D'UN SIMPLE `glob` À PLAT
+    -------------------------------------------------------------------
+    - Parcours RÉCURSIF (`os.walk`) de toute l'arborescence, pas seulement
+      le dossier racine — indispensable pour une bibliothèque organisée en
+      artiste/album/pistes.
+    - La structure de dossiers est REPRODUITE À L'IDENTIQUE côté sortie
+      (chemin relatif préservé), donc pas de collision entre deux pistes
+      qui porteraient le même nom dans deux albums différents (très
+      fréquent: "01 xxx.flac" existe dans presque chaque album).
+    - Les fichiers NON-AUDIO (pochettes, .lrc, tout ce qui n'est pas dans
+      `--extensions`) sont copiés tels quels dans la sortie, pour obtenir
+      une bibliothèque de sortie complète et directement utilisable, pas
+      seulement les pistes corrigées éparpillées sans leurs pochettes.
+    - REPRISE: si un fichier de sortie existe déjà, il est ignoré par
+      défaut (utile pour reprendre un traitement interrompu sur une grosse
+      bibliothèque sans tout refaire depuis le début). `--overwrite` pour
+      forcer le retraitement de tout.
+    - Un ÉCHEC SUR UN FICHIER N'ARRÊTE PAS LE reste DU LOT : chaque appel
+      ffmpeg est isolé, les échecs sont collectés et rapportés à la fin
+      (avec un log détaillé), plutôt que de stopper toute la bibliothèque
+      à la première piste corrompue/problématique.
+    - `--jobs N` : traite N fichiers en parallèle (utile sur une grosse
+      bibliothèque ; chaque appel ffmpeg tourne dans un sous-processus,
+      donc le parallélisme est sûr même en Python malgré le GIL — les
+      threads Python passent le plus clair de leur temps à attendre que le
+      sous-processus ffmpeg termine). Défaut: 1 (séquentiel, logs plus
+      lisibles) ; monte à 4-8 sur une machine multi-cœurs pour accélérer
+      nettement un traitement de plusieurs milliers de pistes.
+    - `--dry-run` : affiche ce qui serait fait (compte de fichiers audio à
+      corriger, fichiers annexes à copier, fichiers ignorés car déjà
+      présents) sans rien exécuter — utile pour vérifier avant de lancer un
+      traitement long sur une bibliothèque volumineuse.
+    """
     with open(args.profile) as f:
         profile = json.load(f)
     filt = build_filter_complex(profile)
-    os.makedirs(args.output_dir, exist_ok=True)
-    exts = (".flac", ".wav", ".mp3", ".m4a", ".ogg")
-    files = [p for p in glob.glob(os.path.join(args.input_dir, "*")) if p.lower().endswith(exts)]
-    print(f"{len(files)} fichier(s) à traiter.")
-    for path in files:
-        name = os.path.basename(path)
-        out_path = os.path.join(args.output_dir, name)
+
+    audio_exts = tuple(
+        e if e.startswith(".") else "." + e
+        for e in (x.strip().lower() for x in args.extensions.split(","))
+        if e
+    )
+
+    input_root = os.path.abspath(args.input_dir)
+    output_root = os.path.abspath(args.output_dir)
+
+    all_files = []
+    for dirpath, _dirnames, filenames in os.walk(input_root):
+        for fname in filenames:
+            all_files.append(os.path.join(dirpath, fname))
+
+    audio_files = [p for p in all_files if p.lower().endswith(audio_exts)]
+    other_files = [p for p in all_files if p not in audio_files]
+
+    print(f"Arborescence: {len(audio_files)} fichier(s) audio à corriger, "
+          f"{len(other_files)} fichier(s) annexe(s) à copier tel quel "
+          f"(pochettes, paroles...), sous {input_root}")
+    if args.dry_run:
+        print("(dry-run: aucune action ne sera réellement exécutée)")
+
+    # --- Fichiers annexes: copie brute, structure préservée ---
+    copied, copy_skipped = 0, 0
+    if not args.skip_others:
+        for path in other_files:
+            rel = os.path.relpath(path, input_root)
+            out_path = os.path.join(output_root, rel)
+            if os.path.exists(out_path) and not args.overwrite:
+                copy_skipped += 1
+                continue
+            if not args.dry_run:
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                shutil.copy2(path, out_path)
+            copied += 1
+
+    # --- Fichiers audio: liste des tâches restantes (après filtre reprise) ---
+    tasks = []  # (path, rel, out_path)
+    audio_skipped = 0
+    for path in audio_files:
+        rel = os.path.relpath(path, input_root)
+        out_path = os.path.join(output_root, rel)
+        if os.path.exists(out_path) and not args.overwrite:
+            audio_skipped += 1
+            continue
+        tasks.append((path, rel, out_path))
+
+    if args.dry_run:
+        print(f"  -> {len(tasks)} piste(s) seraient corrigées, {audio_skipped} déjà présente(s) ignorée(s), "
+              f"{copied} fichier(s) annexe(s) seraient copiés, {copy_skipped} déjà présents ignorés.")
+        return
+
+    def process_one(item):
+        path, rel, out_path = item
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
         cmd = ["ffmpeg", "-y", "-i", path, "-filter_complex", filt, "-map", "[out]"]
         if path.lower().endswith(".flac"):
             cmd += ["-c:a", "flac"]
         cmd.append(out_path)
-        print(f"  -> {name}")
-        subprocess.run(cmd, check=True)
-    print(f"Terminé. Fichiers corrigés dans: {args.output_dir}")
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            return (rel, False, result.stderr.decode(errors="replace")[-800:])
+        return (rel, True, None)
+
+    print(f"Traitement de {len(tasks)} piste(s) audio ({audio_skipped} déjà présente(s) ignorée(s)), "
+          f"parallélisme: {args.jobs}...")
+
+    processed, failures = 0, []
+    if args.jobs <= 1:
+        for i, item in enumerate(tasks, start=1):
+            rel = item[1]
+            print(f"  [{i}/{len(tasks)}] {rel}")
+            _, ok, err = process_one(item)
+            if ok:
+                processed += 1
+            else:
+                failures.append((rel, err))
+                print(f"      ECHEC: {rel}")
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures = {pool.submit(process_one, item): item[1] for item in tasks}
+            done = 0
+            for future in concurrent.futures.as_completed(futures):
+                done += 1
+                rel, ok, err = future.result()
+                status = "OK" if ok else "ECHEC"
+                print(f"  [{done}/{len(tasks)}] {status}: {rel}")
+                if ok:
+                    processed += 1
+                else:
+                    failures.append((rel, err))
+
+    print()
+    print(f"Terminé. {processed} piste(s) corrigée(s), {audio_skipped} déjà présente(s) ignorée(s), "
+          f"{copied} fichier(s) annexe(s) copié(s) ({copy_skipped} déjà présents ignorés), "
+          f"{len(failures)} échec(s).")
+
+    if failures:
+        log_path = os.path.join(output_root, "_erreurs_batch.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            for rel, err in failures:
+                f.write(f"=== {rel} ===\n{err}\n\n")
+        print(f"Fichiers en échec ({len(failures)}):")
+        for rel, _err in failures[:20]:
+            print(f"  - {rel}")
+        if len(failures) > 20:
+            print(f"  ... et {len(failures)-20} autre(s), voir le log complet.")
+        print(f"Détails complets des erreurs: {log_path}")
 
 
 # ----------------------------------------------------------------------------
@@ -1443,10 +1581,24 @@ def main():
     sp.add_argument("-o", "--output", required=True)
     sp.set_defaults(func=cmd_apply)
 
-    sp = sub.add_parser("batch-apply", help="Applique le profil de correction à tout un dossier")
+    sp = sub.add_parser("batch-apply", help="Applique le profil de correction à toute une arborescence "
+                                             "(récursif, sous-dossiers imbriqués, fichiers annexes copiés)")
     sp.add_argument("profile")
     sp.add_argument("input_dir")
     sp.add_argument("output_dir")
+    sp.add_argument("--extensions", default="flac,wav,mp3,m4a,ogg,opus,wma,aac",
+                     help="Extensions traitées comme fichiers audio, séparées par des virgules "
+                          "(défaut: flac,wav,mp3,m4a,ogg,opus,wma,aac)")
+    sp.add_argument("--overwrite", action="store_true",
+                     help="Retraite/recopie même les fichiers déjà présents dans la sortie "
+                          "(par défaut: ignorés, pratique pour reprendre un traitement interrompu)")
+    sp.add_argument("--skip-others", action="store_true",
+                     help="Ne copie pas les fichiers non-audio (pochettes, .lrc...) dans la sortie")
+    sp.add_argument("--jobs", type=int, default=1,
+                     help="Nombre de fichiers traités en parallèle (défaut: 1 séquentiel ; "
+                          "monte à 4-8 pour accélérer sur une grosse bibliothèque)")
+    sp.add_argument("--dry-run", action="store_true",
+                     help="Affiche ce qui serait fait sans rien exécuter réellement")
     sp.set_defaults(func=cmd_batch_apply)
 
     args = p.parse_args()
