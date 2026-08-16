@@ -1208,8 +1208,12 @@ def cmd_build_eq(args):
             vals.append(float(row[col]))
     freqs_l, vals = np.array(freqs_l), np.array(vals)
 
-    # rééchantillonne sur une grille log régulière avant lissage
-    grid = np.geomspace(max(20, freqs_l.min()), min(20000, freqs_l.max()), 500)
+    # rééchantillonne sur une grille log régulière avant lissage — bornée par
+    # les fréquences réellement présentes dans le CSV d'entrée (pas de
+    # plafond arbitraire à 20kHz: si tu as mesuré au-delà, ex. un test large
+    # bande jusqu'à 48kHz avec --samplerate/--f-max adaptés à
+    # generate-sweep, le profil de correction couvrira cette bande entière).
+    grid = np.geomspace(max(freqs_l.min(), 1.0), freqs_l.max(), 500)
     diff_grid = np.interp(grid, freqs_l, vals)
     diff_smooth = smooth_fractional_octave(grid, diff_grid, fraction=args.smoothing)
 
@@ -1261,8 +1265,9 @@ def build_gain_entry(points, key):
 
 
 def build_filter_complex(profile):
-    """Construit la chaîne `filter_complex` ffmpeg complète qui applique une
-    correction EQ INDÉPENDANTE sur chaque canal :
+    """Construit la chaîne `filter_complex` ffmpeg complète (labels `[0:a]`/
+    `[out]` ajoutés autour du graphe brut de `build_lavfi_graph`) qui
+    applique une correction EQ INDÉPENDANTE sur chaque canal :
     1. `channelsplit` sépare le flux stéréo en deux flux mono (L et R).
     2. Un `firequalizer` distinct est appliqué à chaque flux mono, avec sa
        propre courbe de gain (gain_L_dB pour L, gain_R_dB pour R) — c'est ce
@@ -1270,15 +1275,31 @@ def build_filter_complex(profile):
        un EQ stéréo classique qui applique la même courbe aux deux.
     3. `join` recombine les deux flux mono corrigés en un flux stéréo final.
     """
+    graph = build_lavfi_graph(profile)
+    return f"[0:a]{graph}[out]"
+
+
+def build_lavfi_graph(profile):
+    """Construit le graphe `libavfilter` BRUT (channelsplit -> 2x firequalizer
+    -> join), SANS les labels `[0:a]`/`[out]` spécifiques à la syntaxe
+    `-filter_complex`/`-map` de ffmpeg. C'est cette version sans labels
+    qu'attend le pont `lavfi` de mpv (`--af=lavfi=[...]`) : mpv n'a pas la
+    notion de flux `0:a` (un seul flux audio continu traverse le filtre), le
+    graphe doit donc avoir exactement UNE entrée et UNE sortie non labellisées
+    à ses deux extrémités — ce que `channelsplit` (entrée) et `join` (sortie)
+    fournissent naturellement ici. Vérifié comme syntaxe valide via
+    `ffmpeg -af "<ce graphe>"` (même parseur `avfilter_graph_parse2` que mpv).
+    Réutilisé à la fois par `build_filter_complex` (ffmpeg, labels ajoutés) et
+    par `cmd_mpv_command` (mpv, tel quel).
+    """
     gain_L = build_gain_entry(profile["points"], "gain_L_dB")
     gain_R = build_gain_entry(profile["points"], "gain_R_dB")
-    filt = (
-        "[0:a]channelsplit=channel_layout=stereo[L][R];"
+    return (
+        "channelsplit=channel_layout=stereo[L][R];"
         f"[L]firequalizer=gain_entry='{gain_L}'[Lc];"
         f"[R]firequalizer=gain_entry='{gain_R}'[Rc];"
-        "[Lc][Rc]join=inputs=2:channel_layout=stereo[out]"
+        "[Lc][Rc]join=inputs=2:channel_layout=stereo"
     )
-    return filt
 
 
 def cmd_apply(args):
@@ -1298,6 +1319,70 @@ def cmd_apply(args):
     print("Commande ffmpeg:", " ".join(cmd))
     subprocess.run(cmd, check=True)
     print(f"Fichier corrigé: {args.output}")
+
+
+# ----------------------------------------------------------------------------
+# mpv-command : génère la commande mpv qui applique le profil en lecture
+# directe, sans passer par un fichier corrigé ré-encodé.
+# ----------------------------------------------------------------------------
+
+def cmd_mpv_command(args):
+    """Génère la commande (ou la ligne de config) mpv qui applique le profil
+    de correction EN LECTURE DIRECTE, via le pont `lavfi` de mpv vers
+    `libavfilter` (le même moteur de filtres qu'utilise ffmpeg). Alternative
+    à `apply`/`batch-apply` quand tu ne veux pas ré-encoder toute ta
+    bibliothèque, juste écouter avec la correction appliquée à la volée.
+
+    Le graphe utilisé (`build_lavfi_graph`) est EXACTEMENT le même que celui
+    utilisé par `apply`, moins les labels `[0:a]`/`[out]` propres à la
+    syntaxe `-filter_complex`/`-map` de ffmpeg — mpv n'a pas cette notion de
+    flux numérotés, un seul flux audio traverse le filtre implicitement.
+    Vérifié comme syntaxe valide via `ffmpeg -af "<graphe>"` (même parseur
+    `avfilter_graph_parse2` que le pont lavfi de mpv).
+
+    DEUX FORMATS DE SORTIE :
+    - Par défaut : une commande mpv complète et directement copiable-collable
+      dans un terminal (bash/zsh), avec le fichier à lire (ou un
+      placeholder si non précisé).
+    - `--conf` : la ligne au format `mpv.conf` (sans le `mpv --` devant),
+      à coller dans ton fichier de config mpv (~/.config/mpv/mpv.conf) pour
+      que la correction s'applique AUTOMATIQUEMENT à chaque lecture, sans
+      avoir à retaper la commande à chaque fois.
+
+    ATTENTION QUOTING SHELL : la commande générée utilise des guillemets
+    doubles autour de `--af=...` et des guillemets simples à l'intérieur
+    (pour `gain_entry='...'`) — cette combinaison fonctionne telle quelle
+    dans bash/zsh (Linux/macOS/WSL). Sous PowerShell ou l'invite de
+    commandes Windows, les règles de guillemets sont différentes ; utilise
+    plutôt `--conf` et colle la ligne dans mpv.conf pour éviter le problème
+    entièrement (mpv.conf n'a pas ces soucis de quoting shell).
+    """
+    with open(args.profile) as f:
+        profile = json.load(f)
+    graph = build_lavfi_graph(profile)
+
+    if args.conf:
+        line = f"af=lavfi=[{graph}]"
+        print(line)
+        if args.output:
+            with open(args.output, "a") as f:
+                f.write(line + "\n")
+            print(f"\nLigne ajoutée à: {args.output}")
+            print("(colle/fusionne ce fichier avec ~/.config/mpv/mpv.conf pour une application automatique)")
+    else:
+        display_target = args.file if args.file else "<fichier_audio>"
+        cmd_display = f'mpv --af="lavfi=[{graph}]" "{display_target}"'
+        print(cmd_display)
+        if args.output:
+            script_target = f'"{args.file}"' if args.file else '"$1"'
+            script_cmd = f'mpv --af="lavfi=[{graph}]" {script_target}'
+            with open(args.output, "w") as f:
+                f.write("#!/usr/bin/env bash\n")
+                f.write(script_cmd + "\n")
+            os.chmod(args.output, 0o755)
+            print(f"\nCommande écrite dans: {args.output} (exécutable)")
+            if not args.file:
+                print("  Usage: ./<script> mon_fichier.flac  (le fichier passé en argument remplace le placeholder)")
 
 
 def cmd_batch_apply(args):
@@ -1580,6 +1665,19 @@ def main():
     sp.add_argument("input")
     sp.add_argument("-o", "--output", required=True)
     sp.set_defaults(func=cmd_apply)
+
+    sp = sub.add_parser("mpv-command", help="Génère la commande mpv (ou ligne mpv.conf) qui applique le "
+                                             "profil en lecture directe, sans ré-encoder de fichier")
+    sp.add_argument("profile", help="JSON issu de build-eq")
+    sp.add_argument("--file", default=None,
+                     help="Fichier audio à lire (optionnel — sans ça, un placeholder est utilisé)")
+    sp.add_argument("--conf", action="store_true",
+                     help="Sort le format mpv.conf (af=lavfi=[...]) au lieu de la commande mpv complète, "
+                          "pour une application automatique à chaque lecture")
+    sp.add_argument("-o", "--output", default=None,
+                     help="Écrit le résultat dans un fichier (script .sh exécutable, ou fichier "
+                          "mpv.conf-compatible avec --conf) plutôt que de juste l'afficher")
+    sp.set_defaults(func=cmd_mpv_command)
 
     sp = sub.add_parser("batch-apply", help="Applique le profil de correction à toute une arborescence "
                                              "(récursif, sous-dossiers imbriqués, fichiers annexes copiés)")

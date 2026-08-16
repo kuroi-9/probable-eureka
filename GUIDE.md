@@ -317,6 +317,52 @@ fichier renommé/déplacé séparément de son `.meta.json`...), le toolkit
 retombe sur 20-20000 Hz avec un avertissement explicite plutôt que
 d'échouer silencieusement.
 
+### Test large bande, au-delà de l'audible
+
+Rien n'empêche de mesurer au-delà de 20kHz (comportement ultrasonique du
+DAC/de l'ampli, filtre de reconstruction...), à condition de respecter le
+**théorème de Nyquist** : une chaîne échantillonnant à un taux `sr` ne peut
+représenter fidèlement aucune fréquence au-delà de `sr/2`. Ce n'est pas une
+limite du toolkit, c'est une limite physique/mathématique incontournable de
+toute conversion analogique-numérique.
+
+**Le goulot d'étranglement est presque toujours ta carte son en capture**,
+pas ton baladeur en lecture — un DAC peut très bien accepter des sample
+rates élevés (192kHz couramment) alors que la carte son qui capture le
+résultat plafonne plus bas. Vérifie la vraie limite matérielle de ton
+entrée avant de choisir tes réglages :
+
+```bash
+arecord -l                                          # trouve le hw:X,Y de ton entrée
+arecord -D hw:0,0 --dump-hw-params -d 1 /dev/null    # affiche la ligne RATE: [min max]
+```
+
+Préfère interroger directement ALSA (`hw:X,Y`) plutôt que PulseAudio/
+PipeWire, qui n'exposent souvent que le taux négocié par le serveur audio
+(44100/48000Hz typiquement), pas la vraie capacité du matériel.
+
+Une fois la vraie limite connue, choisis `--samplerate` pour `generate-sweep`
+avec une bonne marge sous la moitié de cette limite (Nyquist), par exemple
+pour une carte capable de 192kHz :
+
+```bash
+python3 dac_correction_toolkit.py generate-sweep -o sweep_wide.wav \
+    --f-min 15 --f-max 45000 --samplerate 192000 --margin-ratio 0.1 --duration 30
+```
+
+`--samplerate` doit être identique entre le fichier source et
+l'enregistrement capturé (`measure` refuse explicitement sinon, avec un
+message d'erreur clair — pas de piège silencieux à ce niveau). En revanche,
+si `--samplerate` est trop bas par rapport à `--f-max` demandé, `chirp()`
+génère un contenu **replié (aliasé)** en dessous de Nyquist, **sans aucune
+erreur ni avertissement** — vérifie toi-même que
+`f_max × (1 + margin_ratio) < samplerate / 2`, avec une marge de sécurité
+confortable (quelques centaines de Hz à quelques kHz selon le sample rate).
+
+Le profil de correction généré par `build-eq` n'est plus plafonné à 20kHz :
+il couvre exactement la bande présente dans le CSV d'entrée, donc un test
+large bande se répercute naturellement jusqu'au bout de la chaîne.
+
 
 ### Gain fixe vs dépendant du volume
 
@@ -390,7 +436,7 @@ Dans les deux cas : joue à un volume que tu utilises habituellement en
 écoute, et vérifie l'absence d'écrêtage (peak level < 0dBFS avec de la
 marge).
 
-### Étape 5 — Isoler le défaut réel du baladeur
+### Étape 3 — Isoler le défaut réel du baladeur
 
 **Méthode recommandée (mono-diff)** — isole au câble un pôle de sortie du
 baladeur à la fois, capture en mono, toujours via la même entrée physique
@@ -416,9 +462,9 @@ Les deux méthodes affichent un résumé (moyenne, écart max) directement dans
 le terminal. `swap-diff` te signale en plus si la coloration détectée sur
 la carte son était significative.
 
-### Étape 6 — (Recommandé) Vérifier la dépendance au volume
+### Étape 4 — (Recommandé) Vérifier la dépendance au volume
 
-Répète les étapes 2 à 5 à plusieurs volumes (ex: 25%, 50%, 75%, 100% du
+Répète les étapes 2 à 3 à plusieurs volumes (ex: 25%, 50%, 75%, 100% du
 volume max du baladeur), puis :
 
 ```bash
@@ -429,24 +475,37 @@ Le script te dit si le défaut est un gain fixe ou dépend du volume (voir
 [section 4](#gain-fixe-vs-dépendant-du-volume)), avec un seuil ajustable via
 `--threshold` (0.3dB par défaut).
 
-### Étape 7 — Construire le profil de correction
+### Étape 5 — Construire le profil de correction
 
 ```bash
 python3 dac_correction_toolkit.py build-eq defaut_reel.csv -o profil_correction.json
 ```
 
 Options : `--smoothing 6` (1/6 octave par défaut), `--points 40` (nombre de
-points dans le filtre ffmpeg final).
+points dans le filtre ffmpeg final). Le profil couvre exactement la bande
+présente dans `defaut_reel.csv`, sans plafond arbitraire — utile si tu as
+mesuré au-delà de 20kHz (voir [section 4](#test-large-bande-au-delà-de-laudible)).
 
-### Étape 8 — Appliquer la correction
+### Étape 6 — Appliquer la correction
 
+Deux façons de faire, pas exclusives l'une de l'autre :
+
+**A. Ré-encoder les fichiers** (une fois pour toutes, bibliothèque dupliquée) :
 ```bash
 # Un seul fichier
 python3 dac_correction_toolkit.py apply profil_correction.json morceau.flac -o morceau_corrige.flac
 
-# Tout un dossier
+# Toute une arborescence (récursif, structure préservée, pochettes/paroles copiées)
 python3 dac_correction_toolkit.py batch-apply profil_correction.json ./musique/ ./musique_corrigee/
 ```
+
+**B. Lecture directe avec mpv** (sans dupliquer aucun fichier) :
+```bash
+python3 dac_correction_toolkit.py mpv-command profil_correction.json --file morceau.flac
+```
+Voir [section 8](#lecture-directe-avec-mpv-sans-ré-encoder) pour les autres
+modes (script réutilisable, application automatique permanente via
+`mpv.conf`).
 
 ---
 
@@ -489,11 +548,77 @@ Le filtre généré :
 - Reste lissé (1/6 octave par défaut) pour éviter de coller au bruit de
   mesure.
 
-Si le défaut s'est révélé **dépendant du volume** à l'étape 6, corrige
+Si le défaut s'est révélé **dépendant du volume** à l'étape 4, corrige
 spécifiquement à partir de la mesure faite au volume que tu utilises
 réellement le plus souvent — une correction "juste à 90%" au bon volume
 vaut mieux qu'une correction théoriquement parfaite mesurée à un volume que
 tu n'utilises jamais.
+
+### Ré-encoder toute une bibliothèque (`batch-apply`)
+
+Pensé pour une vraie arborescence de musique (artiste/album/pistes en
+sous-dossiers imbriqués, noms en n'importe quel alphabet, pochettes et
+paroles mélangées aux pistes) :
+
+```bash
+# Aperçu avant de lancer quoi que ce soit sur une grosse bibliothèque
+python3 dac_correction_toolkit.py batch-apply profil_correction.json ./musique/ ./musique_corrigee/ --dry-run
+
+# Exécution, en parallèle pour accélérer
+python3 dac_correction_toolkit.py batch-apply profil_correction.json ./musique/ ./musique_corrigee/ --jobs 4
+```
+
+Ce que ça gère automatiquement :
+- **Parcours récursif** de toute l'arborescence, structure de dossiers
+  **reproduite à l'identique** en sortie (pas de collision entre pistes de
+  même nom dans des albums différents).
+- **Fichiers annexes copiés tels quels** (pochettes, `.lrc`...) — bibliothèque
+  de sortie complète et directement utilisable.
+- **Reprise automatique** : les fichiers déjà présents en sortie sont
+  ignorés par défaut, donc relancer la même commande après une interruption
+  reprend exactement là où ça s'est arrêté (`--overwrite` pour forcer un
+  retraitement complet).
+- **Un échec sur une piste n'arrête pas le reste du lot** — chaque fichier
+  est traité indépendamment, les échecs sont listés à la fin avec un log
+  détaillé (`_erreurs_batch.log` dans le dossier de sortie).
+- `--jobs N` pour paralléliser (chaque appel ffmpeg tourne dans son propre
+  sous-processus, donc sûr même en Python malgré le GIL).
+- `--extensions` pour ajuster la liste des formats traités comme audio
+  (par défaut : flac,wav,mp3,m4a,ogg,opus,wma,aac).
+- `--skip-others` pour ne pas copier les fichiers non-audio si tu ne veux
+  que les pistes corrigées.
+
+### Lecture directe avec mpv, sans ré-encoder
+
+Alternative à `apply`/`batch-apply` quand tu ne veux pas dupliquer toute ta
+bibliothèque, juste écouter avec la correction appliquée à la volée :
+
+```bash
+python3 dac_correction_toolkit.py mpv-command profil_correction.json --file morceau.flac
+```
+
+Ça affiche une commande mpv complète et copiable-collable, qui utilise le
+pont `lavfi` de mpv vers `libavfilter` (le même moteur de filtres
+qu'utilise ffmpeg en interne) — donc la correction appliquée est
+rigoureusement identique à celle de `apply`, juste sans ré-encoder de
+fichier.
+
+Trois façons d'en récupérer le résultat :
+- **Par défaut** : affiche la commande à copier-coller dans un terminal.
+- **`-o script.sh`** : écrit un script exécutable réutilisable
+  (`./script.sh mon_fichier.flac`).
+- **`--conf`** : sort la ligne au format `mpv.conf` (colle-la dans
+  `~/.config/mpv/mpv.conf` pour une application **automatique et
+  permanente**, à chaque lecture, sans avoir à retaper quoi que ce soit) :
+  ```bash
+  python3 dac_correction_toolkit.py mpv-command profil_correction.json --conf -o mpv_snippet.conf
+  ```
+
+**Attention quoting shell** : la commande générée par défaut utilise des
+guillemets doubles/simples combinés, qui fonctionnent tels quels dans
+bash/zsh (Linux/macOS/WSL). Sous PowerShell/invite de commandes Windows,
+les règles de guillemets diffèrent — préfère `--conf` dans ce cas, qui
+évite le problème entièrement.
 
 ---
 
@@ -506,9 +631,12 @@ tu n'utilises jamais.
 | Résultats très différents entre deux mesures identiques (répétabilité faible) | Bruit de fond trop élevé ; refais le test dans un environnement plus calme, ou augmente l'amplitude du sweep (avec marge anti-écrêtage) |
 | `swap-diff` donne une coloration carte son (`ΔM`) énorme | Un réglage a probablement changé entre les deux sessions (gain d'entrée, AGC réactivé...) ; recommence les deux sessions à la suite sans rien toucher entre les deux |
 | `mono-diff` avec `--channel` donne un résultat incohérent (valeurs énormes) | Piège classique de l'approche `--mono-channel` : le canal indiqué doit correspondre exactement à l'index où atterrit le vrai signal dans les DEUX fichiers `measure`. Utilise plutôt `measure-mono` (fichiers vraiment mono), qui élimine ce risque structurellement |
+| Cohérence basse (`< 0.9`) affichée par `measure`/`measure-mono`, surtout avec `generate-noise` | Bruit de fond trop élevé par rapport au signal de test, AGC/suppression de bruit activée sur l'entrée (voir section dépannage matériel), ou mauvais device de capture sélectionné |
 | Le filtre `firequalizer` échoue au lancement de ffmpeg | Vérifie la version de ffmpeg (`ffmpeg -version`) ; certaines compilations minimales n'incluent pas ce filtre |
 | Fichier corrigé qui sonne "bizarre"/trop filtré | Augmente `--smoothing` (valeur plus petite = lissage plus large) dans `build-eq`, le profil colle peut-être trop au bruit de mesure |
 | `measure` affiche une dérive d'horloge de plusieurs milliers de ppm | Anormalement élevé (au-delà de ~1000-2000ppm, plutôt le signe d'un problème d'alignement que d'une vraie dérive d'horloge) — vérifie l'absence de coupures/décrochages dans l'enregistrement |
+| `generate-sweep`/`measure` semblent générer du contenu à une fréquence différente de celle demandée, en test large bande | Repliement (aliasing) : `--f-max × (1+margin)` doit rester nettement sous `--samplerate / 2` (Nyquist). Aucune erreur n'est affichée si ce n'est pas le cas — vérifie toi-même ce calcul (voir section 4) |
+| `batch-apply` semble ignorer des fichiers qui devraient être retraités | Comportement de reprise normal : les fichiers déjà présents en sortie sont ignorés par défaut. Utilise `--overwrite` pour forcer le retraitement |
 
 ---
 
@@ -544,13 +672,45 @@ diff              Soustrait une calibration en boucle d'une mesure (méthode sim
 swap-diff         Sépare le défaut réel de la coloration carte son par inversion des canaux
 mono-diff         Sépare le défaut réel via deux captures mono sur la même entrée carte son (recommandé)
 multivolume       Compare plusieurs mesures à différents volumes (gain fixe vs dépendant du volume)
-build-eq          Génère le profil de correction EQ lissé (JSON)
-apply             Applique la correction à un fichier
-batch-apply       Applique la correction à tout un dossier
+build-eq          Génère le profil de correction EQ lissé (JSON), bande non plafonnée
+apply             Applique la correction à un fichier (ré-encode)
+mpv-command       Génère la commande/config mpv pour une lecture corrigée sans ré-encoder
+batch-apply       Applique la correction à toute une arborescence (récursif, unicode, parallèle, reprise)
 ```
 
 Toutes les commandes de mesure (`measure`, `measure-mono`) corrigent
 automatiquement la dérive d'horloge entre lecture et enregistrement
-(désactivable avec `--no-drift-correction`).
+(désactivable avec `--no-drift-correction`), et exportent une colonne de
+cohérence par fréquence (indicateur de qualité de la mesure).
 
 Aide détaillée de chaque commande : `python3 dac_correction_toolkit.py <commande> -h`
+
+---
+
+## 11. Vérifier l'intégrité du toolkit (`test_regression.py`)
+
+Une suite de tests de non-régression est fournie à côté du script
+(`test_regression.py`) — elle génère des signaux synthétiques (aucun
+matériel requis), exécute chaque sous-commande et vérifie les résultats
+numériques attendus, y compris les cas limites (dérive d'horloge simulée,
+coloration de carte son simulée, fichiers corrompus, arborescence unicode,
+etc.).
+
+```bash
+python3 test_regression.py
+```
+
+Par défaut, le script cherche `dac_correction_toolkit.py` **dans le même
+dossier que lui** — place simplement les deux fichiers côte à côte. Sinon,
+précise le chemin explicitement :
+
+```bash
+python3 test_regression.py --toolkit /chemin/vers/dac_correction_toolkit.py
+```
+
+Utile après toute modification du script principal, ou simplement pour
+vérifier que ton installation (dépendances, ffmpeg) fonctionne correctement
+avant de te lancer dans de vraies mesures. Le script affiche un résumé
+PASS/FAIL détaillé et se termine avec un code de sortie non-nul si un test
+échoue (utilisable dans un pipeline d'intégration continue si besoin).
+
